@@ -6,7 +6,7 @@ into an Agno Agent instance.
 
 from __future__ import annotations
 
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock
 
 import pytest
 
@@ -15,15 +15,12 @@ from agno_docs_agent.prompts.instructions import AGENT_SYSTEM_PROMPT
 
 
 class FakeKnowledge:
-    """Minimal knowledge stub that satisfies KnowledgeProtocol."""
+    """Minimal knowledge stub with the interface the Agent expects."""
 
-    def build_context(self, **kwargs) -> str:
-        return "Use semantic search for broad retrieval."
-
-    def get_tools(self, **kwargs) -> list:
+    def search(self, query: str, **kwargs) -> list:
         return []
 
-    async def aget_tools(self, **kwargs) -> list:
+    async def asearch(self, query: str, **kwargs) -> list:
         return []
 
 

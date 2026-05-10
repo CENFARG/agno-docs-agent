@@ -1,23 +1,25 @@
-"""Vector store backed by sqlite-vec for local semantic search.
+"""Vector store backed by sqlite-vec, implemented as an Agno VectorDb ABC subclass.
 
-Provides a lightweight, file-based vector database using the sqlite-vec extension
-with vec0 virtual tables. Implements :class:`KnowledgeProtocol` so it can be used
-directly as an Agno Agent's ``knowledge`` source.
+Subclasses :class:`agno.vectordb.base.VectorDb` so it can be used directly
+as an Agno ``Knowledge.vector_db``. Embeds documents internally via the
+configured embedder.
 """
 
 from __future__ import annotations
 
-import asyncio
+import json
+import os
 import sqlite3
 from dataclasses import dataclass
-from typing import Any, Callable, Dict, List
+from typing import Any, Dict, List, Optional
 
 import sqlite_vec  # type: ignore[import-untyped]
-from agno.knowledge.document import Document
+from agno.knowledge.document.base import Document
+from agno.vectordb.base import VectorDb
 
 
 @dataclass(frozen=True)
-class VectorStoreConfig:
+class SqliteVecDbConfig:
     """Configuration for the sqlite-vec vector store.
 
     Attributes:
@@ -31,178 +33,235 @@ class VectorStoreConfig:
     dimensions: int = 384
 
 
-class VectorStore:
-    """A sqlite-vec backed vector store for cosine-similarity search.
-
-    Wraps a single :class:`sqlite3.Connection` and a vec0 virtual table.
-    Supports atomic batch insertion and nearest-neighbour queries.
+class SqliteVecDb(VectorDb):
+    """A sqlite-vec backed VectorDb for cosine-similarity search.
 
     Args:
-        config: VectorStoreConfig with database path, table name, and dimensions.
-
-    Example:
-        >>> store = VectorStore(VectorStoreConfig(db_path="kb.db"))
-        >>> store.initialize()
-        >>> store.insert(["doc text"], [[0.1, 0.2, ...]])
-        >>> results = store.search([0.3, 0.4, ...], limit=5)
-        >>> results[0]["text"]
-        'doc text'
+        config: SqliteVecDbConfig with path, table name, and dimensions.
+        embedder: An object with a ``get_embedding(text) -> List[float]``
+            method (e.g. Agno's ``SentenceTransformerEmbedder``).
+        **kwargs: Forwarded to :class:`VectorDb.__init__`.
     """
 
-    def __init__(self, config: VectorStoreConfig) -> None:
-        """Initialize the store with a configuration.
-
-        The database connection is opened lazily during :meth:`initialize`.
-        """
+    def __init__(
+        self,
+        config: SqliteVecDbConfig,
+        embedder: Any = None,
+        **kwargs: Any,
+    ) -> None:
+        super().__init__(**kwargs)
         self._config = config
+        self._embedder = embedder
         self._conn: sqlite3.Connection | None = None
 
-    # ------------------------------------------------------------------
-    # Lifecycle
-    # ------------------------------------------------------------------
+    # -- lifecycle ----------------------------------------------------------
 
-    def initialize(self) -> None:
-        """Open the database and create the vec0 table if it does not exist.
-
-        Idempotent: calling ``initialize()`` multiple times is safe.
-        """
+    def create(self) -> None:
+        """Create the vec0 virtual table. Idempotent."""
+        if self._conn is not None:
+            try:
+                self._conn.close()
+            except Exception:
+                pass
+            self._conn = None
         conn = sqlite3.connect(self._config.db_path)
         conn.enable_load_extension(True)
         conn.load_extension(sqlite_vec.loadable_path())
-
         conn.execute(
             f"""CREATE VIRTUAL TABLE IF NOT EXISTS {self._config.table_name}
-            USING vec0(embedding float[{self._config.dimensions}], text TEXT)"""
+            USING vec0(embedding float[{self._config.dimensions}],
+                       content TEXT,
+                       content_hash TEXT partition key,
+                       name TEXT,
+                       meta_data TEXT)"""
         )
         conn.commit()
         self._conn = conn
 
-    # ------------------------------------------------------------------
-    # Data
-    # ------------------------------------------------------------------
+    async def async_create(self) -> None:
+        self.create()
 
-    def insert(self, texts: List[str], embeddings: List[List[float]]) -> None:
-        """Insert a batch of texts with their corresponding embedding vectors.
+    def exists(self) -> bool:
+        """Check whether the vec0 table exists."""
+        if not os.path.isfile(self._config.db_path):
+            return False
+        try:
+            conn = sqlite3.connect(self._config.db_path)
+            conn.enable_load_extension(True)
+            conn.load_extension(sqlite_vec.loadable_path())
+            row = conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name=?",
+                (self._config.table_name,),
+            ).fetchone()
+            conn.close()
+            return row is not None
+        except Exception:
+            return False
 
-        Args:
-            texts: Human-readable strings to store alongside embeddings.
-            embeddings: One 384-dim float vector per text. Must have the same
-                length as *texts*.
+    async def async_exists(self) -> bool:
+        return self.exists()
 
-        Raises:
-            ValueError: If ``len(texts) != len(embeddings)``.
-        """
-        if len(texts) != len(embeddings):
-            raise ValueError(
-                f"Mismatch: {len(texts)} texts vs {len(embeddings)} embeddings"
-            )
+    def drop(self) -> None:
+        """Drop the vec0 table."""
+        self._get_conn().execute(f"DROP TABLE IF EXISTS {self._config.table_name}")
+        self._get_conn().commit()
 
+    async def async_drop(self) -> None:
+        self.drop()
+
+    def delete(self) -> bool:
+        """Delete the underlying database file."""
+        if self._conn is not None:
+            try:
+                self._conn.close()
+            except Exception:
+                pass
+            self._conn = None
+        try:
+            os.remove(self._config.db_path)
+        except FileNotFoundError:
+            pass
+        return not os.path.isfile(self._config.db_path)
+
+    # -- data ---------------------------------------------------------------
+
+    def insert(
+        self,
+        content_hash: str,
+        documents: List[Document],
+        filters: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        """Embed and insert documents into the vector store."""
         conn = self._get_conn()
         with conn:
-            for text, embedding in zip(texts, embeddings):
-                serialized = sqlite_vec.serialize_float32(embedding)
+            for doc in documents:
+                embedding = self._embed(doc.content)
+                meta_json = json.dumps(doc.meta_data) if doc.meta_data else "{}"
                 conn.execute(
-                    f"INSERT INTO {self._config.table_name} (text, embedding) "
-                    "VALUES (?, ?)",
-                    (text, serialized),
+                    f"INSERT INTO {self._config.table_name} "
+                    "(content, content_hash, name, meta_data, embedding) "
+                    "VALUES (?, ?, ?, ?, ?)",
+                    (
+                        doc.content,
+                        content_hash,
+                        doc.name or "",
+                        meta_json,
+                        sqlite_vec.serialize_float32(embedding),
+                    ),
                 )
 
+    async def async_insert(
+        self,
+        content_hash: str,
+        documents: List[Document],
+        filters: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        import asyncio
+
+        await asyncio.to_thread(self.insert, content_hash, documents, filters)
+
     def search(
-        self, query_embedding: List[float], limit: int = 5
-    ) -> List[Dict[str, Any]]:
-        """Search for the *limit* nearest neighbours by cosine similarity.
-
-        Args:
-            query_embedding: A 384-dim float vector to compare against.
-            limit: Maximum number of results to return (default: ``5``).
-
-        Returns:
-            A list of dicts with keys ``"text"`` (str) and ``"score"`` (float).
-            Results are ordered by descending similarity (least distance first).
-            Returns an empty list when the store has no rows.
-        """
-        conn = self._get_conn()
-        serialized = sqlite_vec.serialize_float32(query_embedding)
-
-        rows = conn.execute(
-            f"""SELECT text, distance
+        self,
+        query: str,
+        limit: int = 5,
+        filters: Optional[Any] = None,
+    ) -> List[Document]:
+        """Search by semantic similarity; returns List[Document]."""
+        q_emb = self._embed(query)
+        serialized = sqlite_vec.serialize_float32(q_emb)
+        rows = self._get_conn().execute(
+            f"""SELECT content, content_hash, name, meta_data, distance
             FROM {self._config.table_name}
             WHERE embedding MATCH ?
             ORDER BY distance
             LIMIT ?""",
             (serialized, limit),
         ).fetchall()
+        results: List[Document] = []
+        for row in rows:
+            meta: dict[str, Any] = {}
+            try:
+                meta = json.loads(row[3]) if row[3] else {}
+            except (json.JSONDecodeError, TypeError):
+                pass
+            results.append(
+                Document(
+                    content=row[0],
+                    id=row[1],
+                    name=row[2] or None,
+                    meta_data=meta,
+                )
+            )
+        return results
 
-        return [{"text": row[0], "score": row[1]} for row in rows]
-
-    # ------------------------------------------------------------------
-    # KnowledgeProtocol (Agno integration)
-    # ------------------------------------------------------------------
-
-    def build_context(self, **kwargs: Any) -> str:
-        """Return instructions on how to use this knowledge base."""
-        return (
-            "Use semantic_search(query, limit) to find relevant Agno "
-            "documentation chunks from the local knowledge base."
-        )
-
-    def get_tools(self, **kwargs: Any) -> List[Callable[..., Any]]:
-        """Return synchronous search tools for the agent."""
-        return [self._semantic_search_tool]
-
-    async def aget_tools(self, **kwargs: Any) -> List[Callable[..., Any]]:
-        """Async version of get_tools."""
-        return self.get_tools(**kwargs)
-
-    def retrieve(self, query: str, **kwargs: Any) -> List[Document]:
-        """Retrieve relevant documents for context injection."""
-        import asyncio as _async
-
-        return _async.get_event_loop().run_until_complete(
-            self.aretrieve(query, **kwargs)
-        )
-
-    async def aretrieve(
-        self, query: str, max_results: int = 5, **kwargs: Any
+    async def async_search(
+        self,
+        query: str,
+        limit: int = 5,
+        filters: Optional[Any] = None,
     ) -> List[Document]:
-        """Async retrieval: embed query, search, return Documents."""
-        from agno_docs_agent.knowledge.embedder import EmbedderConfig, LocalEmbedder
+        import asyncio
 
-        embedder = LocalEmbedder(EmbedderConfig())
-        query_emb = await asyncio.to_thread(embedder.embed, query)
-        results = await asyncio.to_thread(self.search, query_emb, limit=max_results)
-        return [
-            Document(content=r["text"], meta_data={"score": r["score"]})
-            for r in results
-        ]
+        return await asyncio.to_thread(self.search, query, limit, filters)
 
-    # ------------------------------------------------------------------
-    # Tool helpers
-    # ------------------------------------------------------------------
+    # -- content hash / name ------------------------------------------------
 
-    def _semantic_search_tool(self, query: str, limit: int = 5) -> str:
-        """Agent-callable semantic search. Embeds query and returns top chunks."""
-        from agno_docs_agent.knowledge.embedder import EmbedderConfig, LocalEmbedder
+    def content_hash_exists(self, content_hash: str) -> bool:
+        row = self._get_conn().execute(
+            f"SELECT 1 FROM {self._config.table_name} "
+            "WHERE content_hash = ? LIMIT 1",
+            (content_hash,),
+        ).fetchone()
+        return row is not None
 
-        embedder = LocalEmbedder(EmbedderConfig())
-        query_embedding = embedder.embed(query)
-        results = self.search(query_embedding, limit=limit)
+    def name_exists(self, name: str) -> bool:
+        row = self._get_conn().execute(
+            f"SELECT 1 FROM {self._config.table_name} WHERE name = ? LIMIT 1",
+            (name,),
+        ).fetchone()
+        return row is not None
 
-        if not results:
-            return "No matching documents found."
+    def async_name_exists(self, name: str) -> bool:
+        return self.name_exists(name)
 
-        lines = [f"Semantic search results for: {query}"]
-        for i, r in enumerate(results, 1):
-            lines.append(f"\n--- Result {i} (score: {r['score']:.4f}) ---")
-            lines.append(r["text"][:1000])
-        return "\n".join(lines)
+    # -- remaining abstract stubs (MVP: raise NotImplementedError) ----------
 
-    # ------------------------------------------------------------------
-    # Internal
-    # ------------------------------------------------------------------
+    def id_exists(self, id: str) -> bool:
+        raise NotImplementedError
+
+    def upsert(self, content_hash: str, documents: List[Document], filters: Optional[Dict[str, Any]] = None) -> None:
+        raise NotImplementedError
+
+    async def async_upsert(self, content_hash: str, documents: List[Document], filters: Optional[Dict[str, Any]] = None) -> None:
+        raise NotImplementedError
+
+    def delete_by_id(self, id: str) -> bool:
+        raise NotImplementedError
+
+    def delete_by_name(self, name: str) -> bool:
+        raise NotImplementedError
+
+    def delete_by_metadata(self, metadata: Dict[str, Any]) -> bool:
+        raise NotImplementedError
+
+    def delete_by_content_id(self, content_id: str) -> bool:
+        raise NotImplementedError
+
+    def get_supported_search_types(self) -> List[str]:
+        raise NotImplementedError
+
+    # -- internal -----------------------------------------------------------
+
+    def _embed(self, text: str) -> List[float]:
+        if self._embedder is None:
+            raise RuntimeError("SqliteVecDb has no embedder configured")
+        if hasattr(self._embedder, "get_embedding"):
+            result: Any = self._embedder.get_embedding(text)
+            return result  # type: ignore[no-any-return]
+        result = self._embedder.embed(text)
+        return result  # type: ignore[no-any-return]
 
     def _get_conn(self) -> sqlite3.Connection:
-        """Return the database connection, raising if not yet initialized."""
         if self._conn is None:
-            raise RuntimeError("VectorStore not initialized — call initialize() first")
+            raise RuntimeError("SqliteVecDb not initialised — call create() first")
         return self._conn
