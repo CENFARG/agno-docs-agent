@@ -1,0 +1,28 @@
+# agno-docs-agent configuration
+# All fields are optional — defaults shown below.
+
+model:
+  provider: ollama          # ollama, openai, anthropic, google
+  name: gemma4:26b          # model identifier for the provider
+  temperature: 0.3
+  max_tokens: 2048
+
+embedder:
+  provider: sentence_transformer  # sentence_transformer, openai, huggingface
+  model: all-MiniLM-L6-v2        # model name for the embedder
+  dimensions: 384
+
+knowledge:
+  db_path: knowledge/agno_agent.db
+  llms_path: knowledge/llms-full.txt
+  chunking:
+    strategy: markdown       # markdown, fixed_size, semantic, recursive
+    chunk_size: 512
+    overlap: 100
+
+server:
+  transport: stdio           # stdio, sse
+  docs_path: C:/Dropbox/DOC.RECA/06-Software/agno-docs  # for MCPTools connection
+
+logging:
+  level: INFO                # DEBUG, INFO, WARNING, ERROR

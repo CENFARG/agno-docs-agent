@@ -64,7 +64,7 @@ class SqliteVecDb(VectorDb):
             except Exception:
                 pass
             self._conn = None
-        conn = sqlite3.connect(self._config.db_path)
+        conn = sqlite3.connect(self._config.db_path, check_same_thread=False)
         conn.enable_load_extension(True)
         conn.load_extension(sqlite_vec.loadable_path())
         conn.execute(
@@ -86,7 +86,7 @@ class SqliteVecDb(VectorDb):
         if not os.path.isfile(self._config.db_path):
             return False
         try:
-            conn = sqlite3.connect(self._config.db_path)
+            conn = sqlite3.connect(self._config.db_path, check_same_thread=False)
             conn.enable_load_extension(True)
             conn.load_extension(sqlite_vec.loadable_path())
             row = conn.execute(
