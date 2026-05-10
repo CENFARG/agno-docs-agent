@@ -30,8 +30,7 @@ from agno_docs_agent.tools.expert import ConsultInput, consult_agno_expert
 # ---------------------------------------------------------------------------
 
 DEFAULT_LLMS_PATH: str = str(
-    Path(os.environ.get("AGNO_DOCS_PATH", "."))
-    / "llms-full.txt"
+    Path(__file__).resolve().parent.parent.parent / "knowledge" / "llms-full.txt"
 )
 
 
@@ -51,7 +50,7 @@ async def lifespan(server: FastMCP) -> AsyncIterator[Dict[str, Any]]:
     docs_path = Path(os.environ.get("AGNO_DOCS_PATH", ".")).resolve()
     llms_path = docs_path / "llms-full.txt"
     db_path = docs_path / "knowledge.db"
-    model_str = os.environ.get("AGNO_MODEL", "openai:gpt-4o-mini")
+    model_str = os.environ.get("AGNO_MODEL", "ollama/gemma4:26b")
     embed_model = os.environ.get("AGNO_EMBED_MODEL", "all-MiniLM-L6-v2")
 
     # 1. Load embedder

@@ -27,7 +27,7 @@ def main() -> None:
     )
     parser.add_argument(
         "--model",
-        default=os.environ.get("AGNO_MODEL", "openai:gpt-4o-mini"),
+        default=os.environ.get("AGNO_MODEL", "ollama/gemma4:26b"),
         help="Model identifier (e.g. openai:gpt-4o-mini, ollama:llama3)",
     )
     parser.add_argument(
