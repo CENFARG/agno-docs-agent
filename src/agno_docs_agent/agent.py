@@ -6,27 +6,27 @@ startup to configure the consult_agno_expert agent.
 
 from __future__ import annotations
 
+from typing import Any
+
 from agno.agent import Agent
-from agno.knowledge.protocol import KnowledgeProtocol
 from agno.tools.mcp import MCPTools
 
 
 def create_agent(
     model: str,
     instructions: str,
-    knowledge: KnowledgeProtocol,
+    knowledge: Any,
     mcp_tools: MCPTools,
 ) -> Agent:
     """Build a configured Agno Agent for answering Agno documentation questions.
 
     Args:
         model: A model identifier string (e.g. ``"openai:gpt-4o-mini"``)
-            or an Agno ``Model`` object. This controls which LLM provider
-            the agent uses.
+            or an Agno ``Model`` object.
         instructions: The system prompt that defines the agent's identity,
             workflow, and constraints.
-        knowledge: A :class:`KnowledgeProtocol` implementation providing
-            semantic retrieval capabilities.
+        knowledge: An Agno ``Knowledge`` instance providing semantic retrieval
+            with its configured embedder and vector database.
         mcp_tools: An :class:`MCPTools` instance connected to an external
             MCP server (typically ``agno-docs-mcp``).
 

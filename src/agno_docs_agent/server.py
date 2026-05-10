@@ -1,9 +1,10 @@
 """FastMCP server that hosts the consult_agno_expert tool.
 
 On startup (lifespan), the server:
-1. Loads the local embedding model.
-2. Initializes or opens the sqlite-vec knowledge base.
-3. Seeds the vector store from ``llms-full.txt`` if empty.
+1. Loads the Agno SentenceTransformerEmbedder.
+2. Initializes or opens the sqlite-vec knowledge base via SqliteVecDb.
+3. Seeds the vector store from ``llms-full.txt`` if empty using Agno's
+   Knowledge with MarkdownReader + MarkdownChunking.
 4. Builds an Agno Agent with knowledge + MCP tools.
 5. Registers ``consult_agno_expert`` as an MCP tool.
 """
@@ -16,12 +17,15 @@ from pathlib import Path
 from typing import Any, AsyncIterator, Dict
 
 from agno.agent import Agent
+from agno.knowledge.chunking.markdown import MarkdownChunking
+from agno.knowledge.embedder.sentence_transformer import SentenceTransformerEmbedder
+from agno.knowledge.knowledge import Knowledge
+from agno.knowledge.reader.markdown_reader import MarkdownReader
 from agno.tools.mcp import MCPTools
 from mcp.server.fastmcp import FastMCP
 
 from agno_docs_agent.agent import create_agent
-from agno_docs_agent.knowledge.embedder import EmbedderConfig, LocalEmbedder
-from agno_docs_agent.knowledge.store import VectorStore, VectorStoreConfig
+from agno_docs_agent.knowledge.store import SqliteVecDb, SqliteVecDbConfig
 from agno_docs_agent.prompts.instructions import AGENT_SYSTEM_PROMPT
 from agno_docs_agent.tools.expert import ConsultInput, consult_agno_expert
 
@@ -53,15 +57,22 @@ async def lifespan(server: FastMCP) -> AsyncIterator[Dict[str, Any]]:
     model_str = os.environ.get("AGNO_MODEL", "ollama/gemma4:26b")
     embed_model = os.environ.get("AGNO_EMBED_MODEL", "all-MiniLM-L6-v2")
 
-    # 1. Load embedder
-    embedder = LocalEmbedder(EmbedderConfig(model_name=embed_model))
+    # 1. Load embedder (Agno native)
+    embedder = SentenceTransformerEmbedder(id=embed_model, dimensions=384)
 
-    # 2. Initialize vector store
-    store = VectorStore(VectorStoreConfig(db_path=str(db_path), dimensions=384))
-    store.initialize()
+    # 2. Initialize vector store (Agno VectorDb ABC)
+    store = SqliteVecDb(
+        config=SqliteVecDbConfig(db_path=str(db_path), dimensions=384),
+        embedder=embedder,
+    )
+    store.create()
 
-    # 3. Seed if empty
-    _seed_knowledge_base(store, embedder, llms_path)
+    # 3. Build Agno Knowledge and seed if empty
+    knowledge = Knowledge(
+        vector_db=store,
+        name="agno-docs",
+    )
+    await _load_knowledge(knowledge, llms_path)
 
     # 4. Connect to agno-docs-mcp
     mcp_cmd = f"python -m mcp_agno_docs {docs_path}"
@@ -71,7 +82,7 @@ async def lifespan(server: FastMCP) -> AsyncIterator[Dict[str, Any]]:
     agent: Agent = create_agent(
         model=model_str,
         instructions=AGENT_SYSTEM_PROMPT,
-        knowledge=store,
+        knowledge=knowledge,
         mcp_tools=mcp_tools,
     )
 
@@ -84,7 +95,6 @@ async def lifespan(server: FastMCP) -> AsyncIterator[Dict[str, Any]]:
     try:
         yield {"agent": agent}
     finally:
-        # Cleanup would go here
         pass
 
 
@@ -105,59 +115,40 @@ def run_server() -> None:
 # ---------------------------------------------------------------------------
 
 
-def _seed_knowledge_base(
-    store: VectorStore, embedder: LocalEmbedder, llms_path: Path
-) -> None:
-    """Chunk and embed llms-full.txt into the vector store if empty.
+async def _load_knowledge(knowledge: Knowledge, llms_path: Path) -> None:
+    """Load and index ``llms-full.txt`` into the knowledge base if empty.
+
+    Uses Agno's native ``MarkdownReader`` with ``MarkdownChunking`` for
+    chunking, and the configured embedder + VectorDb for storage.
 
     Args:
-        store: An initialized VectorStore.
-        embedder: A loaded LocalEmbedder.
+        knowledge: An Agno Knowledge instance with a VectorDb backend.
         llms_path: Path to the llms-full.txt knowledge file.
     """
+    import asyncio
+
     if not llms_path.exists():
         return
 
     # Quick check: already seeded?
-    existing = store.search([0.0] * 384, limit=1)
-    if existing:
-        return
+    store = knowledge.vector_db
+    if store is not None and store.exists():
+        import sqlite_vec as _sv  # type: ignore[import-untyped]
+        zero_vec = _sv.serialize_float32([0.0] * 384)
+        row = store._get_conn().execute(
+            f"SELECT 1 FROM {store._config.table_name} "
+            "WHERE embedding MATCH ? LIMIT 1",
+            (zero_vec,),
+        ).fetchone()
+        if row is not None:
+            return
 
-    # Read and chunk
-    text = llms_path.read_text(encoding="utf-8")
-    chunks = _chunk_text(text, chunk_size=512, overlap=100)
-
-    if not chunks:
-        return
-
-    # Embed in batches to manage memory
-    batch_size = 32
-    for i in range(0, len(chunks), batch_size):
-        batch = chunks[i : i + batch_size]
-        embeddings = embedder.embed_batch(batch)
-        store.insert(batch, embeddings)
-
-
-def _chunk_text(text: str, chunk_size: int = 512, overlap: int = 100) -> list[str]:
-    """Split *text* into roughly ``chunk_size``-word segments with overlap.
-
-    Args:
-        text: Full text content to chunk.
-        chunk_size: Approximate number of words per chunk.
-        overlap: Number of words to overlap between consecutive chunks.
-
-    Returns:
-        List of text chunks.
-    """
-    words = text.split()
-    if len(words) <= chunk_size:
-        return [text]
-
-    chunks: list[str] = []
-    step = max(1, chunk_size - overlap)
-    for i in range(0, len(words), step):
-        chunk_words = words[i : i + chunk_size]
-        if not chunk_words:
-            break
-        chunks.append(" ".join(chunk_words))
-    return chunks
+    # Use Agno's MarkdownReader with MarkdownChunking for chunking
+    await asyncio.to_thread(
+        knowledge.insert,
+        path=str(llms_path),
+        reader=MarkdownReader(
+            chunking_strategy=MarkdownChunking(chunk_size=512)
+        ),
+        upsert=True,
+    )
