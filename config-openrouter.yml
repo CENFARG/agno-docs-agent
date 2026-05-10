@@ -1,0 +1,28 @@
+# agno-docs-agent — OpenRouter (DeepSeek V4) config
+# Fast, cloud-based. Uses key from .env (OPENROUTER_API_KEY)
+
+model:
+  provider: openrouter
+  name: deepseek/deepseek-chat-v3-0324
+  temperature: 0.3
+  max_tokens: 4096
+
+embedder:
+  provider: sentence_transformer
+  model: all-MiniLM-L6-v2
+  dimensions: 384
+
+knowledge:
+  db_path: knowledge/agno_agent.db
+  llms_path: knowledge/llms-full.txt
+  chunking:
+    strategy: markdown
+    chunk_size: 512
+    overlap: 100
+
+server:
+  transport: stdio
+  docs_path: C:/Dropbox/DOC.RECA/06-Software/agno-docs
+
+logging:
+  level: INFO

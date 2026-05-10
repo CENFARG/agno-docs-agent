@@ -3,6 +3,8 @@
 Loads settings from ``config.yml`` with env var overrides.
 Allows switching model providers, embedders, and chunking strategies
 without code changes.
+
+Supports: ollama (local), openrouter, openai, anthropic, google.
 """
 from __future__ import annotations
 
@@ -13,6 +15,19 @@ from typing import Any
 
 import yaml
 
+# Load .env if present
+_ENV_PATH = Path(__file__).resolve().parent.parent.parent / ".env"
+if _ENV_PATH.exists():
+    with open(_ENV_PATH, encoding="utf-8", errors="replace") as f:
+        for line in f:
+            line = line.strip()
+            if line and not line.startswith("#") and "=" in line:
+                key, _, value = line.partition("=")
+                key = key.strip()
+                value = value.strip().strip('"').strip("'")
+                if key not in os.environ:
+                    os.environ[key] = value
+
 
 @dataclass
 class ModelConfig:
@@ -22,6 +37,7 @@ class ModelConfig:
     max_tokens: int = 2048
 
     def to_model_string(self) -> str:
+        """Return Agno-compatible model string (provider:model_id)."""
         return f"{self.provider}:{self.name}"
 
 
@@ -70,7 +86,7 @@ class AgentConfig:
         """Load config from YAML file, with env var overrides."""
         cfg_path = Path(path)
         if not cfg_path.exists():
-            return cls()  # all defaults
+            return cls()
 
         raw = yaml.safe_load(cfg_path.read_text(encoding="utf-8"))
 
@@ -82,7 +98,19 @@ class AgentConfig:
         if os.environ.get("AGNO_EMBED_MODEL"):
             raw.setdefault("embedder", {})["model"] = os.environ["AGNO_EMBED_MODEL"]
 
-        return cls(_parse_recursive(cls, raw))
+        return cls(
+            model=ModelConfig(**raw.get("model", {})),
+            embedder=EmbedderConfig(**raw.get("embedder", {})),
+            knowledge=KnowledgeConfig(
+                **{
+                    **raw.get("knowledge", {}),
+                    "chunking": ChunkingConfig(**raw.get("knowledge", {}).get("chunking", {}))
+                } if "chunking" in raw.get("knowledge", {})
+                else {}
+            ),
+            server=ServerConfig(**raw.get("server", {})),
+            logging=LoggingConfig(**raw.get("logging", {})),
+        )
 
     @classmethod
     def from_env(cls) -> AgentConfig:
